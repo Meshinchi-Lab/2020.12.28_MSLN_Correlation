@@ -1,0 +1,329 @@
+---
+title: "MSLN Correlation to DNMT3, IDH 1/2, and TET"
+author: "Jenny Smith"
+date: ""
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(TOIL,"RNA/mRNAseq/analysis/2020.12.28_MSLN_Correlation"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+library(ggpubr)
+
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+
+getwd()
+```
+
+
+#Define Functions
+
+```{r}
+#https://stackoverflow.com/questions/15720545/use-stat-summary-to-annotate-plot-with-number-of-observations
+n_fun <- function(x){
+  return(data.frame(y = max(x)+1, label = paste0("n = ",length(x))))
+}
+```
+
+
+#Raw Counts
+
+```{r}
+toil.TPM <- get(load(file.path(TOIL, "RNA/mRNAseq/level3/gene/2016Sept_UCSC_Illumina_data/Rdata/TcgaTargetGtex_NormBlood_AML_rsem_geneSymbol_dupGenesRemoved_tpm.RData")))
+
+dim(toil.TPM) #58531   738
+head(toil.TPM[,1:5])
+```
+
+
+```{r eval=FALSE}
+cts <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/TARGET_AML_MPN_DS_NBM_2646Samples_Ribodepleted_RNAseq_geneLevel_dupGenesRemoved_FractionalCounts.RDS"))
+
+# cts <- readRDS(file.path("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2019.12.31_UMAP_Clustering/Expression_Data/TARGET_AML_DSAML_MPN_NBM_Ribodepleted_dupGenesRemoved_Fractionalcounts.RDS"))
+
+cts <- as.data.frame(cts)
+rownames(cts) <- cts$Gene
+cts <- cts[,-1]
+
+head(cts[,1:5])
+dim(cts) #51573  2645
+```
+
+
+#ClinData
+
+https://docs.cancergenomicscloud.org/docs/tcga-metadata 
+https://gdc.cancer.gov/about-data/publications/laml_2012
+
+
+```{r}
+clindata_orig <- read.csv(file.path(TOIL,"Clinical/TCGA_AML_clinData_allPatients.csv"),
+                          na.strings = c("^$","^\\.$","NA","N/A","#N/A")) %>% 
+  select(TCGA.Patient.ID=X,Patient_ID=clinData1.bcr_patient_barcode,everything())
+
+dim(clindata_orig) #200  18
+head(clindata_orig[,1:5])
+```
+
+```{r}
+# grep("^OS|^EFS|vital|alive|event",colnames(clindata_orig), value=T)
+```
+
+```{r}
+clindata_updated <- read.csv(file.path(TOIL, "Clinical/TCGA_AML_updated_NEJM_SuppTable01_12.28.20.csv"),
+                             na.strings = c("",".","NA","N/A","#N/A")) %>% 
+  filter(!is.na(TCGA.Patient.ID))
+
+dim(clindata_updated) #201 2005
+head(clindata_updated[,1:5])
+# tail(clindata_updated)
+```
+
+```{r}
+#missing the actual event/alive/dead designation for some reason
+# grep("^OS|^EFS|vital|alive|event",colnames(clindata_updated), value=T)
+```
+
+```{r}
+clindata <- select(clindata_orig, TCGA.Patient.ID,Patient_ID, 
+                   clinData1.molecular_analysis_abnormality_testing_result,
+                   clinData1.vital_status,
+                   first.event) %>% 
+  full_join(., clindata_updated, 
+            by="TCGA.Patient.ID",
+            suffix=c("_Orig","_Update")) %>% 
+  select(TCGA.Patient.ID, Patient_ID,
+         matches("vital|first.event|^OS\\.|^EFS\\."),
+         everything()) %>% 
+  filter(!(grepl("BCR-ABL Positive|PML-RAR Positive", clinData1.molecular_analysis_abnormality_testing_result) |
+         grepl("PML-RARA|BCR-ABL1",Cytogenetic.Classification))) %>% 
+  mutate(across(matches("TET[123]|DNMT3[AB]|IDH[12]"),
+                .fns = ~case_when(!is.na(.) ~ "Positive", is.na(.) ~ "Negative"),
+                .names = "{col}_mutation_group")) 
+  # mutate(TET1_TET2=case_when(
+  #                   TET1=="Positive" | TET2=="Positive"  ~ "Positive",
+  #                   TRUE ~ "Negative"),
+  #    DNMT3A_DNMT3B=case_when(
+  #                   DNMT3A=="Positive" | DNMT3B=="Positive"  ~ "Positive",
+  #                   TRUE ~ "Negative"))
+  # select(X, Patient_ID=clinData1.bcr_patient_barcode,everything())
+
+dim(clindata) #177 2009
+head(clindata[,1:10]) 
+```
+
+PML-RARA == "APL" N=8
+BCR-ABL == "CML" N=1
+
+Does this mean primary and secondary AML? or?
+Prior diagnosis: Informs whether a case has a known history of an earlier diagnosis of disease/cancer.
+
+```{r}
+# table(clindata$Cytogenetic.Classification)
+raw_mutation_cols <- grep("TET[123]$|DNMT3[AB]$|IDH[12]$", colnames(clindata), value=T)
+mutation_cols <- grep("mutation_group", colnames(clindata), value=T)
+
+sapply(mutation_cols, function(x) table(clindata[[x]]))
+# sapply(raw_mutation_cols, function(x) table(clindata[[x]]))
+```
+
+```{r}
+sample_info <- read.delim(file.path(TOIL, "Clinical/TOIL_Sample_Info/TcgaTargetGTEX_phenotype.txt"), sep="\t") %>% 
+  select(Barcode=sample, Sample=sample, everything()) %>% 
+  mutate(Patient_ID=gsub("-0[0-9]$","", Barcode)) %>% 
+  mutate(Sample=gsub("-",".", Sample)) %>% 
+  filter(primary.disease.or.tissue=="Acute Myeloid Leukemia") %>% 
+  filter(X_study=="TCGA") %>% 
+  filter(Patient_ID %in% clindata$Patient_ID) %>% #only AML (no APL or CML)
+  select(Barcode, Sample, Patient_ID,everything())
+
+dim(sample_info) #155 9
+# head(sample_info)
+# View(sample_info)
+```
+
+```{r}
+table(clindata$Patient_ID %in% sample_info$Patient_ID) #21 samples not in the RNAseq data for some reason?
+table(sample_info$Sample %in% colnames(toil.TPM)) #OK
+```
+
+
+#Correlation to MSLN 
+
+DNMT3, IDH 1/2, and TET
+
+```{r}
+DNAme_genes_withMutations <- expn %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Gene") %>% 
+  gather(Sample, TPM, -Gene) %>% 
+  mutate(Log2TPM=log2(TPM+1)) %>% 
+  select(-TPM) %>% 
+  spread(Gene, Log2TPM) %>% 
+  rename_at(vars(DNMT3A:TET3), ~paste0(.,"_log2_TPM")) %>% 
+  left_join(., select(sample_info,Sample,Patient_ID),
+            by="Sample") %>%
+  left_join(., select(clindata,TCGA.Patient.ID:RISK..Cyto.,
+                      all_of(mutation_cols), all_of(raw_mutation_cols)),
+            by="Patient_ID") %>% 
+  select(Sample,Patient_ID, TCGA.Patient.ID:RISK..Cyto.,
+         all_of(mutation_cols), all_of(raw_mutation_cols), 
+         everything())
+
+head(DNAme_genes_withMutations)
+# dim(DNAme_genes_withMutations) #155  46
+
+# 
+# write.csv(DNAme_genes_withMutations,"TCGA_LAML_DNAmethylation_Mutations_and_MSLN_TPM_12.28.20.csv",row.names = F)
+```
+
+
+## Mutation Correlation
+
+```{r}
+mut_plots <- lapply(mutation_cols, function(colName){
+  ggplot(DNAme_genes_withMutations, aes_string(x=colName, y="MSLN_log2_TPM", fill=colName)) +
+    geom_violin(draw_quantiles = 0.5) +
+    stat_compare_means(comparisons = list(c("Positive","Negative")),
+                       label = "p.format") + #
+    labs(x=gsub("_group","", colName)) +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    scale_fill_brewer(palette = "Paired") +
+    stat_summary(fun.data = n_fun, geom = "text")
+    
+})
+
+length(mut_plots)
+```
+
+```{r fig.height=10, fig.width=10}
+# pdf("TCGA_LAML_MSLN_Association_with_Mutations_12.28.20.pdf", height = 10, width = 10)
+grid.arrange(grobs=mut_plots, ncol=2, top="TCGA LAML Mutations: Association with MSLN Expression")
+# dev.off()
+```
+
+
+```{r}
+# ggplot(DNAme_genes_withMutations, aes(x=DNMT3A_mutations, y=MSLN_log2_TPM, fill=DNMT3A_mutations)) +
+#   geom_violin(draw_quantiles = 0.5) +
+#   stat_compare_means(comparisons = list(c("Positive","Negative")),
+#                      label = "p.signif") + #
+#   theme_bw() +
+#   theme(panel.grid = element_blank()) +
+#   scale_fill_brewer(palette = "Paired") +
+#   stat_summary(fun.data = n_fun, geom = "text")
+```
+
+
+
+
+## Expression Correlation
+
+```{r}
+expn <- toil.TPM[grep("MSLN$|DNMT3[AB]$|IDH[12]$|TET[123]$", rownames(toil.TPM), value=T),sample_info$Sample] 
+
+dim(expn)
+```
+
+```{r}
+GOI <- grep("DNMT3[AB]$|IDH[12]$|TET[123]$", colnames(DNAme_genes_withMutations), value=T)
+GOI
+```
+
+```{r}
+expn_log2 <- t(log2(expn+1))
+corr_res <- psych::corr.test(expn_log2,method="spearman",
+                           adjust="BH",ci=FALSE)
+
+coefs <- corr_res$r %>%
+    as.data.frame() %>%
+    rownames_to_column("Gene1") %>%
+    gather(Gene2, SpearmanRho, -Gene1) 
+  
+pvals <- corr_res$p %>%
+     as.data.frame() %>%
+    rownames_to_column("Gene1") %>%
+    gather(Gene2, Adj.P.val, -Gene1)
+
+res <- inner_join(coefs,pvals, by=c("Gene1","Gene2")) %>% 
+  filter(Gene1=="MSLN") %>% 
+  filter(Gene1 != Gene2) %>% 
+  mutate(Adj.P.val=round(Adj.P.val, digits=4))
+
+dim(res)
+head(res)
+# write.csv(res,"TCGA_LAML_MSLN_Correlation_Coefs_12.28.20.csv", row.names = F)
+```
+
+```{r}
+corr_plots <- lapply(GOI, function(gene){
+  ggplot(DNAme_genes_withMutations, aes_string(x="MSLN", y=gene)) +
+      geom_point() +
+      geom_smooth(method="lm",formula = y ~ x) +
+      theme_bw() +
+      labs(x="MSLN (log2 TPM)", y=paste0(gene," (log2 TPM)")) +
+      theme(panel.grid = element_blank())
+})
+```
+
+```{r}
+length(corr_plots)
+```
+
+```{r fig.height=10, fig.width=10}
+# pdf("TCGA_LAML_MSLN_Correlation_plots_12.28.20.pdf", height = 10, width = 10)
+grid.arrange(grobs=corr_plots, ncol=2, top="TCGA LAML: Correlation with MSLN")
+# dev.off()
+```
+
+
+```{r}
+ggplot(DNAme_genes_withMutations, aes(x=MSLN, y=DNMT3A)) +
+  geom_point() +
+  geom_smooth(method="lm") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
